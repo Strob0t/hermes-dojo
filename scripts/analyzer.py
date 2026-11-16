@@ -11,6 +11,8 @@ Usage:
     python3 analyzer.py --input data.json # Analyze from saved monitor output
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys
@@ -19,6 +21,25 @@ from typing import Any
 
 HERMES_HOME = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 SKILLS_DIR = HERMES_HOME / "skills"
+
+CORE_TOOL_NAMES = {
+    "terminal", "process", "read_file", "write_file", "search_files", "patch",
+    "execute_code", "skill_view", "skill_manage", "skills_list", "memory",
+    "session_search", "browser_navigate", "browser_click", "browser_type",
+    "browser_console", "browser_scroll", "browser_snapshot", "browser_press",
+    "cronjob", "todo", "delegate_task", "clarify",
+}
+
+
+def _autofix_allowed(monitor_data: dict) -> bool:
+    dq = monitor_data.get("data_quality") or {}
+    if dq and not dq.get("safe_to_autofix", False):
+        return False
+    return monitor_data.get("total_tool_calls", 1) > 0
+
+
+def _canon_target(name: str) -> str:
+    return name.lower().replace("_", "-").replace(" ", "-")
 
 
 def find_existing_skills() -> dict[str, Path]:
@@ -176,10 +197,43 @@ def search_skills_for_capability(capability: str, existing_skills: dict[str, Pat
     return None
 
 
+def _tool_needs_verification(tool: dict) -> bool:
+    return bool(
+        tool.get("last_success_after_error")
+        or tool.get("status") in {"recovered", "stale_failure"}
+    )
+
+
+def _recommendation_action(tool: dict, skill_name: str | None) -> str:
+    if _tool_needs_verification(tool):
+        return "investigate"
+    if skill_name:
+        return "patch"
+    return "investigate" if tool["tool"] in CORE_TOOL_NAMES else "create"
+
+
+def _reason_for_tool(tool: dict, action: str) -> str:
+    base = (
+        f"{tool['tool']} fails {tool['errors']}/{tool['total']} times "
+        f"({tool['success_rate']}% success)"
+    )
+    if _tool_needs_verification(tool):
+        status = tool.get("status")
+        if status == "stale_failure":
+            return base + "; no recent failures, so verify current behavior before patching"
+        return base + "; recovered by a later successful call, so verify/regression-test before patching"
+    if action == "investigate" and tool["tool"] in CORE_TOOL_NAMES:
+        return f"Frequently-failing core tool '{tool['tool']}' ({tool['errors']} errors)"
+    if action == "create":
+        return f"Frequently-failing tool '{tool['tool']}' ({tool['errors']} errors)"
+    return base
+
+
 def generate_recommendations(monitor_data: dict) -> list[dict[str, Any]]:
     """Generate prioritized improvement recommendations."""
     recommendations = []
     existing_skills = find_existing_skills()
+    autofix_allowed = _autofix_allowed(monitor_data)
 
     # Pre-compute root causes for all weakest_tools to avoid re-classifying
     _tool_root_causes = {}
@@ -198,47 +252,50 @@ def generate_recommendations(monitor_data: dict) -> list[dict[str, Any]]:
             continue
 
         skill_name = map_tool_to_skill(tool["tool"], existing_skills)
+        action = _recommendation_action(tool, skill_name)
+        rec = {
+            "action": action,
+            "priority": _priority_score(tool),
+            "target": skill_name if skill_name else _tool_to_skill_name(tool["tool"]),
+            "reason": _reason_for_tool(tool, action),
+            "top_error": tool["top_error"],
+            "suggested_fix": _suggest_fix(tool),
+            "autofix_allowed": autofix_allowed and action in {"patch", "create"},
+        }
         if skill_name:
-            recommendations.append({
-                "action": "patch",
-                "priority": _priority_score(tool),
-                "target": skill_name,
-                "skill_path": str(existing_skills[skill_name]),
-                "reason": f"{tool['tool']} fails {tool['errors']}/{tool['total']} times "
-                          f"({tool['success_rate']}% success)",
-                "top_error": tool["top_error"],
-                "suggested_fix": _suggest_fix(tool),
-                "root_cause": root_cause,
-            })
-        else:
-            # Tool has no associated skill — might benefit from one
-            recommendations.append({
-                "action": "create",
-                "priority": _priority_score(tool),
-                "target": _tool_to_skill_name(tool["tool"]),
-                "reason": f"No skill found for frequently-failing tool '{tool['tool']}' "
-                          f"({tool['errors']} errors)",
-                "top_error": tool["top_error"],
-                "suggested_fix": _suggest_fix(tool),
-                "root_cause": root_cause,
-            })
+            rec["skill_path"] = str(existing_skills[skill_name])
+        rec["root_cause"] = root_cause
+        if _tool_needs_verification(tool):
+            rec["status"] = tool.get("status", "recovered")
+            rec["suggested_fix"] = "Add or run a regression/smoke test; do not patch live code from stale historical failures"
+            rec["autofix_allowed"] = False
+        recommendations.append(rec)
 
-    # 2. Create recommendations for skill gaps
+    # 2. Create recommendations for high-confidence skill gaps only.
     skill_descriptions = _load_skill_descriptions(existing_skills)
     for gap in monitor_data.get("skill_gaps", []):
         cap = gap["capability"]
-        # Deep check: skill names AND descriptions via keyword overlap.
-        # This avoids recommending a skill when one already exists, e.g.
-        #   "docker-management" already covers "docker", "csv-parsing" already covers "csv".
+        requests = int(gap.get("requests", 0) or 0)
+        sessions = int(gap.get("sessions", 0) or 0)
+        high_confidence = gap.get("confidence") == "high" or (requests >= 5 and sessions >= 3)
+        # Deep check: skill names AND descriptions via keyword overlap, so we do
+        # not recommend a skill when one already exists (e.g. "docker-management"
+        # already covered by a "docker" skill).
         existing_match = search_skills_for_capability(cap, existing_skills, skill_descriptions)
         if existing_match:
             continue  # Already covered by an installed skill
         recommendations.append({
-            "action": "create",
-            "priority": gap["requests"] * 10,
-            "target": cap,
-            "reason": f"Users requested '{cap}' {gap['requests']} times but no skill exists",
-            "suggested_fix": f"Create a skill for {cap} based on successful session patterns",
+            "action": "create" if high_confidence else "investigate",
+            "priority": requests * 10,
+            "target": _canon_target(cap),
+            "reason": (
+                f"Users requested '{cap}' {requests} times across {sessions} sessions"
+                if high_confidence else
+                f"Weak skill-gap signal for '{cap}' ({requests} matches across {sessions} sessions); needs review"
+            ),
+            "suggested_fix": f"Create a skill for {cap} based on successful session patterns" if high_confidence else "Collect more evidence before creating a skill",
+            "autofix_allowed": autofix_allowed and high_confidence,
+            "confidence": "high" if high_confidence else "low",
         })
 
     # 3. Evolve recommendations for skills with moderate failure rates (only skill-fixable ones)
@@ -263,7 +320,7 @@ def generate_recommendations(monitor_data: dict) -> list[dict[str, Any]]:
         recommendations.append({
             "action": "investigate",
             "priority": retry["count"] * 5,
-            "target": retry["tool"],
+            "target": _canon_target(retry["tool"]),
             "reason": f"Tool '{retry['tool']}' called {retry['count']}x in rapid succession "
                       f"(retry loop detected)",
         })
@@ -303,7 +360,7 @@ def _priority_score(tool: dict) -> float:
 
 def _tool_to_skill_name(tool_name: str) -> str:
     """Convert a tool name to a valid skill name."""
-    return tool_name.lower().replace("_", "-").replace(" ", "-")
+    return _canon_target(tool_name)
 
 
 def _suggest_fix(tool: dict) -> str:
